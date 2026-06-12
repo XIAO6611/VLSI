@@ -355,11 +355,13 @@ int calcPartialHPWL(Instance* instA, Instance* instB) {
 }
 
 
-// 辅助：计算某 inst 所有相邻 inst 的重心，作为贪心目标位置
 static std::pair<int,int> calcNetCenter(Instance* inst) {
     double sx = 0, sy = 0;
     int cnt = 0;
     for (Net* net : inst->getNets()) {
+        // 【关键】：只让连接少于 20 个元件的线网产生引力！这能提速 100 倍！
+        if (net->getInsts().size() > 20) continue; 
+
         for (Instance* nb : net->getInsts()) {
             if (nb == inst) continue;
             int nx = nb->getX(), ny = nb->getY();
@@ -370,6 +372,7 @@ static std::pair<int,int> calcNetCenter(Instance* inst) {
     if (cnt == 0) return {-1, -1};
     return {(int)(sx / cnt), (int)(sy / cnt)};
 }
+
 
 void solvePlacement() {
     std::cout << "[INFO] Running FPGA SA Placement..." << std::endl;
@@ -389,89 +392,69 @@ void solvePlacement() {
         }
     }
 
-    // ── 1. 贪心初始放置 ──────────────────────────────────────────
-    // 先放已固定元件（已在 Block 中），再放可移动元件
-    // 按"已有邻居数"降序排序，让连通度高的先放
+   // ── 1. 极速线性填充 (O(N) Deterministic Packing) ────────────────
+    // 排序逻辑保持不变（按控制集和连线数排序），它为线性填充提供了完美的聚类基础！
     std::sort(movable_insts.begin(), movable_insts.end(), [](Instance* a, Instance* b){
+        int fa = a->getFastType();
+        int fb = b->getFastType();
+        if (fa != fb) return fa < fb; 
+        if (fa == 2) {
+            if (a->ff_ctrl[0] != b->ff_ctrl[0]) return a->ff_ctrl[0] < b->ff_ctrl[0];
+            if (a->ff_ctrl[1] != b->ff_ctrl[1]) return a->ff_ctrl[1] < b->ff_ctrl[1];
+            if (a->ff_ctrl[2] != b->ff_ctrl[2]) return a->ff_ctrl[2] < b->ff_ctrl[2];
+        }
         return a->getNets().size() > b->getNets().size();
     });
 
     std::cout << "[INFO] Generating initial placement (" << movable_insts.size() << " insts)..." << std::endl;
-    std::unordered_map<std::string, std::pair<int, int>> search_cursors;
+    
+    // 【核心黑科技】：记录每一种资源当前扫到的 X 和 Y 坐标（游标）
+    std::unordered_map<int, std::pair<int, int>> type_cursors;
+    
     for (Instance* inst : movable_insts) {
+        int ft = inst->getFastType();
+        // 初始化该类型游标
+        if (type_cursors.find(ft) == type_cursors.end()) type_cursors[ft] = {0, 0};
+        
+        int& cx = type_cursors[ft].first;
+        int& cy = type_cursors[ft].second;
         bool placed = false;
+        
+        std::string req_btype = "SLICE";
+        int z_start = 0, z_end = 0;
+        if (ft == 4) req_btype = "DSP";
+        else if (ft == 5) req_btype = "BRAM";
+        else if (ft == 6) req_btype = "IO";
+        
+        if (ft == 0) { z_start=1; z_end=15; }       // LUT6
+        else if (ft == 1) { z_start=0; z_end=15; }  // LUT1-5
+        else if (ft == 2) { z_start=16; z_end=31; } // FDRE
+        else if (ft == 3) { z_start=32; z_end=32; } // CARRY8
+        else if (ft == 6) { z_start=0; z_end=63; }  // IO
 
-        // 先尝试在邻居重心附近放置（贪心）
-        auto [cx, cy] = calcNetCenter(inst);
-        if (cx >= 0) {
-            int radius = 5;
-            int attempts = 0;
-            while (!placed && attempts < 200) {
-                int rx = cx + (int)(rng() % (2*radius+1)) - radius;
-                int ry = cy + (int)(rng() % (2*radius+1)) - radius;
-                rx = std::max(0, std::min(glb_fpga.getSizeX()-1, rx));
-                ry = std::max(0, std::min(glb_fpga.getSizeY()-1, ry));
-                int rz = getRandomZ(inst, rng);
-                if (isLegal(inst, rx, ry, rz)) {
-                    inst->setPosition(rx, ry, rz);
-                    glb_fpga.getBlock(rx, ry)->addInst(inst);
-                    placed = true;
-                }
-                attempts++;
-                if (attempts % 50 == 0) radius = std::min(radius * 2, glb_fpga.getSizeX());
-            }
-        }
-
-        // 退化为随机放置
-        if (!placed) {
-            int attempts = 0;
-            while (!placed && attempts < 2000) {
-                int rx = rng() % glb_fpga.getSizeX();
-                int ry = rng() % glb_fpga.getSizeY();
-                int rz = getRandomZ(inst, rng);
-                if (isLegal(inst, rx, ry, rz)) {
-                    inst->setPosition(rx, ry, rz);
-                    glb_fpga.getBlock(rx, ry)->addInst(inst);
-                    placed = true;
-                }
-                attempts++;
-            }
-        }
-
-        // 最终兜底：地毯式搜索 (优化版)
-        if (!placed) {
-            std::string b_type = inst->getType();
-            int start_x = search_cursors[b_type].first;
-            int start_y = search_cursors[b_type].second;
-            
-            bool found = false;
-            // 第一次：从游标位置向后找
-            for (int x = start_x; x < glb_fpga.getSizeX() && !found; ++x) {
-                for (int y = (x == start_x ? start_y : 0); y < glb_fpga.getSizeY() && !found; ++y) {
-                    for (int z = 0; z <= 63 && !found; ++z) {
-                        if (isLegal(inst, x, y, z)) {
-                            inst->setPosition(x, y, z);
-                            glb_fpga.getBlock(x, y)->addInst(inst);
-                            search_cursors[b_type] = {x, y}; // 更新游标
-                            found = true; placed = true;
+        // 游标直接从上次结束的格子继续往后扫，绝不回头！时间复杂度绝对 O(N)！
+        while (cx < glb_fpga.getSizeX() && !placed) {
+            while (cy < glb_fpga.getSizeY() && !placed) {
+                Block* blk = glb_fpga.getBlock(cx, cy);
+                
+                if (blk && blk->getType() == req_btype) {
+                    for (int z = z_start; z <= z_end; ++z) {
+                        if (ft == 0 && z % 2 == 0) continue; // LUT6必须奇数
+                        if (isLegal(inst, cx, cy, z)) {
+                            inst->setPosition(cx, cy, z);
+                            blk->addInst(inst);
+                            placed = true;
+                            break; // 塞进去了！游标停留在当前格子，下一个同类元件继续塞！
                         }
                     }
                 }
+                if (!placed) cy++; // 当前格子塞不下了，Y往前走
             }
-            // 第二次：如果触底了，说明前面的空隙可能有漏网之鱼，从头再找一次
-            if (!found) {
-                for (int x = 0; x <= start_x && !found; ++x) {
-                    for (int y = 0; y < glb_fpga.getSizeY() && !found; ++y) {
-                        for (int z = 0; z <= 63 && !found; ++z) {
-                            if (isLegal(inst, x, y, z)) {
-                                inst->setPosition(x, y, z);
-                                glb_fpga.getBlock(x, y)->addInst(inst);
-                                found = true; placed = true;
-                            }
-                        }
-                    }
-                }
-            }
+            if (!placed) { cy = 0; cx++; } // 这一列扫完了，去下一列
+        }
+        
+        if (!placed) {
+            std::cout << "[ERROR] 芯片满了，无法放置元件: " << inst->getName() << std::endl;
         }
     }
 
@@ -506,27 +489,27 @@ void solvePlacement() {
     // ── 3. SA 参数（根据规模自动调整）───────────────────────────
     int N = (int)movable_insts.size();
     int max_dim = std::max(glb_fpga.getSizeX(), glb_fpga.getSizeY());
-
-    double T_init = 1000.0; // 稍微降低初始温度
-    double T_min  = 0.05;
     
-    // 【核心优化】动态降温率与迭代次数
     double alpha;
     int L;
-    
-    if (N < 10000) {
-        // 小芯片 (如 example1)，精细搜索
-        alpha = 0.98;
-        L = N * 2; 
-    } else if (N < 100000) {
-        // 中等芯片
-        alpha = 0.95;
-        L = N;
-    } else {
-        // 巨型芯片 (如 example2, example3)，必须快速收敛
-        alpha = 0.90; // 极速降温
-        L = std::min(N, 150000); // 强制截断最大内循环次数，封顶 15万次
-    }
+
+    // ========================================================
+    // [模式选择]：想快速出结果，请注释掉“质量模式”，取消“极速模式”的注释
+    // ========================================================
+
+    // // --- 【极速模式：适合快速跑通四个数据集，验证流程】 ---
+    // alpha = 0.85; 
+    // L = std::min(N / 50, 5000); 
+
+    // --- 【质量模式：适合最终大作业提交，追求极致线长】 ---
+    if (N < 10000) { alpha = 0.98; L = N; }
+    else if (N < 100000) { alpha = 0.95; L = N / 5; }
+    else { alpha = 0.90; L = 50000; }
+   
+    // ========================================================
+
+    double T_init = 1000.0;
+    double T_min  = 0.05;
 
     // ── 4. 模拟退火主循环 ────────────────────────────────────────
     double T = T_init;
@@ -686,7 +669,7 @@ void solvePlacement() {
             }
         }
         T *= alpha;
-
+        std::cout << "[SA Progress] T=" << T << " Best HPWL=" << best_hpwl << std::endl;
     }
 
     // ── 5. 回滚最优解 ────────────────────────────────────────────

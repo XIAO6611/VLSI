@@ -3,11 +3,12 @@
 #define OBJECT_H
 
 #define MAX_INT 0x3f3f3f3f
-
+#include <algorithm>
 #include <set>
 #include <iostream>
 #include <map>     
 #include <string>
+#include <vector>
 
 class Net;
 
@@ -22,7 +23,7 @@ private:
     int fast_type;
     std::string name; // 【新增】元件名字，如 inst_1024
     std::string type; // 【新增】元件类型，如 LUT6, FDRE, DSP48E2
-    std::set<Net *> connect_net;
+    std::vector<Net *> connect_net;
 
 public:
     Net* lut_inputs[6] = {nullptr}; // 存 I0 到 I5
@@ -59,13 +60,18 @@ public:
         } else if (pin == "CE") {
             ff_ctrl[2] = n;
         }
-        // 这一行保留，用于后续 HPWL 遍历
-        connect_net.insert(n); 
+        
+        // vector 没有 insert(value)，改为 push_back 并去重
+        if (std::find(connect_net.begin(), connect_net.end(), n) == connect_net.end()) {
+            connect_net.push_back(n); 
+        }
     }
-    std::set<Net *> getNets() { return connect_net; }
-    void addNet(Net *i_net_id) { this->connect_net.insert(i_net_id); };
-    
-    // 【修改】升级为3D坐标设置
+    std::vector<Net *> getNets() { return connect_net; }
+    void addNet(Net *i_net_id) { 
+        if (std::find(connect_net.begin(), connect_net.end(), i_net_id) == connect_net.end()) {
+            connect_net.push_back(i_net_id); 
+        }
+    };
     void setPosition(int i_x, int i_y, int i_z = 0) {
         if (this->isFixed()) return;
         this->x = i_x; this->y = i_y; this->z = i_z;
@@ -85,7 +91,7 @@ private:
     int net_id;
     std::string name;     // 【新增】线网名称
     double weight = 1.0;  // 【新增】线网权重，默认 1.0
-    std::set<Instance *> connect_inst;
+    std::vector<Instance *> connect_inst;
 
 public:
     Net() { net_id = -1; }
@@ -93,14 +99,19 @@ public:
     void setNetId(int i_net_id) { this->net_id = i_net_id; }
     int getNetId() { return this->net_id; }
     
-    // 【新增】名称和权重的 Getter/Setter
     void setName(std::string n) { this->name = n; }
     std::string getName() { return this->name; }
     void setWeight(double w) { this->weight = w; }
     double getWeight() { return this->weight; }
 
-    void addInst(Instance *i_inst) { this->connect_inst.insert(i_inst); }
-    std::set<Instance *> getInsts() { return this->connect_inst; }
+    void addInst(Instance *i_inst) { 
+        if (std::find(connect_inst.begin(), connect_inst.end(), i_inst) == connect_inst.end()) {
+            connect_inst.push_back(i_inst); 
+        }
+    }
+    
+    // 【修复3】返回值从 std::set 改为 std::vector
+    std::vector<Instance *> getInsts() { return this->connect_inst; }
     int evalHPWL();
 };
 
