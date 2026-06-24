@@ -314,7 +314,11 @@ void solvePlacement() {
     int window = std::max(500, N / 50);              // 【优化】动态扩大合法化搜索窗口 (从 200 扩大到 500+)
     double T0 = is_small ? 50.0 : 200.0;             // 【优化】提高初始退火温度，增加逃离局部最优的能力
     int num_steps = is_small ? 20 : 35;
-    int L = is_small ? std::min(N * 50, 500000) : std::min(N * 15, 1000000); // 【优化】单步退火迭代次数暴增
+    // int L = is_small ? std::min(N * 50, 500000) : std::min(N * 15, 1000000); // 【优化】单步退火迭代次数暴增
+    int L = is_small ? N * 40 : N * 15;
+
+
+
     // =========================================================================
     // ── 1. 网格化电场解析布局 ──
     // =========================================================================
@@ -551,9 +555,13 @@ void solvePlacement() {
             }
         }
     }
-    std::cout << "[DEBUG] Bucket matched: " << placed_count << ", overflow: " << overflow_insts.size() << std::endl;
+std::cout << "[DEBUG] Bucket matched: " << placed_count << ", overflow: " << overflow_insts.size() << std::endl;
 
-    // 溢出处理（跨桶）
+    // =========================================================================
+    // 【优化重构部分】：高效中心圈扩散搜索（替换原来的全图盲目 O(X*Y) 扫描）
+    // =========================================================================
+    
+    // 1. 溢出处理（跨桶）
     for (Instance* inst : overflow_insts) {
         int ft = inst->getFastType();
         double cx = cont_pos[inst->getInstId()].first;
@@ -561,6 +569,8 @@ void solvePlacement() {
         int gx0 = std::max(0, std::min(bx - 1, (int)(cx / BUCKET_SIZE)));
         int gy0 = std::max(0, std::min(by - 1, (int)(cy / BUCKET_SIZE)));
         bool placed = false;
+
+        // 优先在邻近的空间哈希桶内进行搜索
         for (int r = 1; r <= 8 && !placed; ++r) {
             for (int dx = -r; dx <= r && !placed; ++dx) {
                 for (int dy = -r; dy <= r && !placed; ++dy) {
@@ -579,23 +589,79 @@ void solvePlacement() {
                 }
             }
         }
+
+        // 邻近桶未找到，启动高效的正方形壳层向外圈层扩散搜索（终极 Fallback）
         if (!placed) {
-            // 终极 fallback
-            for (int x = 0; x < glb_fpga.getSizeX() && !placed; ++x) {
-                for (int y = 0; y < glb_fpga.getSizeY() && !placed; ++y) {
-                    Block* blk = glb_fpga.getBlock(x, y);
-                    if (!blk) continue;
-                    int z_start = 0, z_end = 0;
-                    if (ft == 0) { z_start=1; z_end=15; } else if (ft == 1) { z_start=0; z_end=15; }
-                    else if (ft == 2) { z_start=16; z_end=31; } else if (ft == 3) { z_start=32; z_end=32; }
-                    else if (ft == 6) { z_start=0; z_end=63; } else { z_start=0; z_end=0; }
-                    for (int z = z_start; z <= z_end && !placed; ++z) {
-                        if (ft == 0 && z % 2 == 0) continue;
-                        if (blk->isZFree(z) && isLegal(inst, x, y, z)) {
-                            inst->setPosition(x, y, z);
-                            blk->addInst(inst);
-                            placed = true;
+            int start_x = std::max(0, std::min(glb_fpga.getSizeX() - 1, (int)cx));
+            int start_y = std::max(0, std::min(glb_fpga.getSizeY() - 1, (int)cy));
+            int max_r = std::max(glb_fpga.getSizeX(), glb_fpga.getSizeY());
+
+            int z_start = 0, z_end = 0;
+            if (ft == 0) { z_start = 1; z_end = 15; }
+            else if (ft == 1) { z_start = 0; z_end = 15; }
+            else if (ft == 2) { z_start = 16; z_end = 31; }
+            else if (ft == 3) { z_start = 32; z_end = 32; }
+            else if (ft == 6) { z_start = 0; z_end = 63; }
+            else { z_start = 0; z_end = 0; }
+
+            for (int r = 0; r <= max_r && !placed; ++r) {
+                if (r == 0) {
+                    Block* blk = glb_fpga.getBlock(start_x, start_y);
+                    if (blk) {
+                        for (int z = z_start; z <= z_end; ++z) {
+                            if (ft == 0 && z % 2 == 0) continue;
+                            if (blk->isZFree(z) && isLegal(inst, start_x, start_y, z)) {
+                                inst->setPosition(start_x, start_y, z);
+                                blk->addInst(inst);
+                                placed = true;
+                                break;
+                            }
                         }
+                    }
+                    continue;
+                }
+                
+                // 扩散搜索：扫描当前半径 r 的正方形的上下边界边界
+                for (int dx = -r; dx <= r && !placed; ++dx) {
+                    int x = start_x + dx;
+                    if (x < 0 || x >= glb_fpga.getSizeX()) continue;
+                    for (int sign : {-1, 1}) {
+                        int y = start_y + sign * r;
+                        if (y < 0 || y >= glb_fpga.getSizeY()) continue;
+                        Block* blk = glb_fpga.getBlock(x, y);
+                        if (!blk) continue;
+                        for (int z = z_start; z <= z_end; ++z) {
+                            if (ft == 0 && z % 2 == 0) continue;
+                            if (blk->isZFree(z) && isLegal(inst, x, y, z)) {
+                                inst->setPosition(x, y, z);
+                                blk->addInst(inst);
+                                placed = true;
+                                break;
+                            }
+                        }
+                        if (placed) break;
+                    }
+                }
+                
+                // 扩散搜索：扫描当前半径 r 的正方形的左右边界
+                for (int dy = -r + 1; dy <= r - 1 && !placed; ++dy) {
+                    int y = start_y + dy;
+                    if (y < 0 || y >= glb_fpga.getSizeY()) continue;
+                    for (int sign : {-1, 1}) {
+                        int x = start_x + sign * r;
+                        if (x < 0 || x >= glb_fpga.getSizeX()) continue;
+                        Block* blk = glb_fpga.getBlock(x, y);
+                        if (!blk) continue;
+                        for (int z = z_start; z <= z_end; ++z) {
+                            if (ft == 0 && z % 2 == 0) continue;
+                            if (blk->isZFree(z) && isLegal(inst, x, y, z)) {
+                                inst->setPosition(x, y, z);
+                                blk->addInst(inst);
+                                placed = true;
+                                break;
+                            }
+                        }
+                        if (placed) break;
                     }
                 }
             }
@@ -603,32 +669,89 @@ void solvePlacement() {
         if (!placed) std::cerr << "[ERROR] Failed to place " << inst->getName() << std::endl;
     }
 
-    // 最终强制修复（确保所有元件都放置）
+    // 2. 最终强制修复（确保所有依然缺失坐标的元件获得兜底合法位置）
     int still_unplaced = 0;
     for (Instance* inst : movable_insts) {
         if (inst->getX() == -1) {
             still_unplaced++;
             int ft = inst->getFastType();
+            double cx = cont_pos[inst->getInstId()].first;
+            double cy = cont_pos[inst->getInstId()].second;
+            int start_x = std::max(0, std::min(glb_fpga.getSizeX() - 1, (int)cx));
+            int start_y = std::max(0, std::min(glb_fpga.getSizeY() - 1, (int)cy));
+            int max_r = std::max(glb_fpga.getSizeX(), glb_fpga.getSizeY());
+
             int z_start = 0, z_end = 0;
-            if (ft == 0) { z_start=1; z_end=15; } else if (ft == 1) { z_start=0; z_end=15; }
-            else if (ft == 2) { z_start=16; z_end=31; } else if (ft == 3) { z_start=32; z_end=32; }
-            else if (ft == 6) { z_start=0; z_end=63; } else { z_start=0; z_end=0; }
-            for (int x = 0; x < glb_fpga.getSizeX(); ++x) {
-                for (int y = 0; y < glb_fpga.getSizeY(); ++y) {
-                    Block* blk = glb_fpga.getBlock(x, y);
-                    if (!blk) continue;
-                    for (int z = z_start; z <= z_end; ++z) {
-                        if (ft == 0 && z % 2 == 0) continue;
-                        if (blk->isZFree(z) && isLegal(inst, x, y, z)) {
-                            inst->setPosition(x, y, z);
-                            blk->addInst(inst);
-                            placed_count++;
-                            goto next_inst;
+            if (ft == 0) { z_start = 1; z_end = 15; }
+            else if (ft == 1) { z_start = 0; z_end = 15; }
+            else if (ft == 2) { z_start = 16; z_end = 31; }
+            else if (ft == 3) { z_start = 32; z_end = 32; }
+            else if (ft == 6) { z_start = 0; z_end = 63; }
+            else { z_start = 0; z_end = 0; }
+
+            bool fixed_placed = false;
+            for (int r = 0; r <= max_r && !fixed_placed; ++r) {
+                if (r == 0) {
+                    Block* blk = glb_fpga.getBlock(start_x, start_y);
+                    if (blk) {
+                        for (int z = z_start; z <= z_end; ++z) {
+                            if (ft == 0 && z % 2 == 0) continue;
+                            if (blk->isZFree(z) && isLegal(inst, start_x, start_y, z)) {
+                                inst->setPosition(start_x, start_y, z);
+                                blk->addInst(inst);
+                                placed_count++;
+                                fixed_placed = true;
+                                break;
+                            }
                         }
+                    }
+                    continue;
+                }
+                // 扫描上下边
+                for (int dx = -r; dx <= r && !fixed_placed; ++dx) {
+                    int x = start_x + dx;
+                    if (x < 0 || x >= glb_fpga.getSizeX()) continue;
+                    for (int sign : {-1, 1}) {
+                        int y = start_y + sign * r;
+                        if (y < 0 || y >= glb_fpga.getSizeY()) continue;
+                        Block* blk = glb_fpga.getBlock(x, y);
+                        if (!blk) continue;
+                        for (int z = z_start; z <= z_end; ++z) {
+                            if (ft == 0 && z % 2 == 0) continue;
+                            if (blk->isZFree(z) && isLegal(inst, x, y, z)) {
+                                inst->setPosition(x, y, z);
+                                blk->addInst(inst);
+                                placed_count++;
+                                fixed_placed = true;
+                                break;
+                            }
+                        }
+                        if (fixed_placed) break;
+                    }
+                }
+                // 扫描左右边
+                for (int dy = -r + 1; dy <= r - 1 && !fixed_placed; ++dy) {
+                    int y = start_y + dy;
+                    if (y < 0 || y >= glb_fpga.getSizeY()) continue;
+                    for (int sign : {-1, 1}) {
+                        int x = start_x + sign * r;
+                        if (x < 0 || x >= glb_fpga.getSizeX()) continue;
+                        Block* blk = glb_fpga.getBlock(x, y);
+                        if (!blk) continue;
+                        for (int z = z_start; z <= z_end; ++z) {
+                            if (ft == 0 && z % 2 == 0) continue;
+                            if (blk->isZFree(z) && isLegal(inst, x, y, z)) {
+                                inst->setPosition(x, y, z);
+                                blk->addInst(inst);
+                                placed_count++;
+                                fixed_placed = true;
+                                break;
+                            }
+                        }
+                        if (fixed_placed) break;
                     }
                 }
             }
-            next_inst:;
         }
     }
     if (still_unplaced > 0) std::cout << "[INFO] Fixed " << still_unplaced << " unplaced instances in final fallback." << std::endl;
@@ -636,6 +759,9 @@ void solvePlacement() {
     long long current_hpwl = 0;
     for (auto& [id, net] : glb_net_map) { net->updateCache(); current_hpwl += net->cached_hpwl; }
     std::cout << "[INFO] Legalization Done. Placed: " << placed_count << ", HPWL: " << current_hpwl << std::endl;
+
+
+
 
     // =========================================================================
     // ── 3. 模拟退火 (空槽跳跃 + 自适应小电路参数) ──
@@ -658,7 +784,14 @@ void solvePlacement() {
             // ================= 智能探索策略 =================
             int rx, ry;
             double move_prob = dist_prob(rng);
-            if (move_prob < 0.2) {
+
+
+
+
+
+
+            if (move_prob < 0.7) {
+            // if (move_prob < 0.2) {
                 // 策略 1 (20%概率)：重心引力。向相连的元件聚拢，极大加速线长收敛
                 auto [cx, cy] = calcNetCenter(instA);
                 if (cx >= 0) {
@@ -668,11 +801,14 @@ void solvePlacement() {
                     rx = std::max(0, std::min(glb_fpga.getSizeX() - 1, old_x + (int)(rng() % (2*rad+1)) - rad));
                     ry = std::max(0, std::min(glb_fpga.getSizeY() - 1, old_y + (int)(rng() % (2*rad+1)) - rad));
                 }
-            } else if (move_prob < 0.6) {
+            } 
+            else if (move_prob < 0.95) {
+            // else if (move_prob < 0.6) {
                 // 策略 2 (40%概率)：局部随机。在当前温度半径内探索，避免局部死锁
                 rx = std::max(0, std::min(glb_fpga.getSizeX() - 1, old_x + (int)(rng() % (2*rad+1)) - rad));
                 ry = std::max(0, std::min(glb_fpga.getSizeY() - 1, old_y + (int)(rng() % (2*rad+1)) - rad));
-            } else {
+            } 
+            else {
                 // 策略 3 (40%概率)：全局同类交换。直接找一个同类型元件尝试互换位置，打破宏观拥堵
                 int target_idx = rng() % N;
                 Instance* target = movable_insts[target_idx];
@@ -685,6 +821,14 @@ void solvePlacement() {
                 }
             }
             // ===============================================
+
+
+
+
+
+
+
+
 
             Block* blockB = glb_fpga.getBlock(rx, ry);
             if (!blockB) continue;
@@ -846,4 +990,3 @@ void solvePlacement() {
     for (auto& [id, net] : glb_net_map) final_hpwl += net->evalHPWL();
     std::cout << "[INFO] Workflow Finished. Final HPWL: " << final_hpwl << std::endl;
 }
-
